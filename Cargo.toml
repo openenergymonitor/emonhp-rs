@@ -1,0 +1,47 @@
+[package]
+edition = "2024"
+name = "emonhp-rs"
+version = "0.1.0"
+authors = ["Angus Logan <awjlogan@gmail.com>"]
+resolver = "2"
+
+[[bin]]
+name = "emonhp-rs"
+test = false
+bench = false
+
+[dependencies]
+defmt = "1.0"
+defmt-rtt = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+embedded-hal = "1.0.0"
+embedded-hal-async = "1.0.0"
+embedded-io = "0.7"
+embedded-io-async = "0.7"
+embedded-storage = "0.3.1"
+cortex-m-rt = "0.7.3"
+
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "defmt", "executor-interrupt"] }
+# embassy-futures = { version = "0.1.2" }
+embassy-sync = { version = "0.7" }
+embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32c031c6", "unstable-pac", "memory-x", "time-driver-any", "exti" ]  }
+
+ssd1306 = "0.10.0"
+embedded-graphics = "0.8.2"
+heapless = "0.9.3"
+static_cell = "2"
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = 's'
+
+[profile.dev]
+debug = 2
+lto = true
+opt-level = "s"
