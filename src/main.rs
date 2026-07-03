@@ -95,7 +95,7 @@ fn display_boot(
     let res = display.init();
 
     info!("Initialising SSD1306...");
-    if let Err(_e) = res {
+    if let Err(_) = res {
         info!("  - Failed.");
     } else {
         info!("  - Success.");
@@ -104,7 +104,9 @@ fn display_boot(
         let im = Image::new(&raw, Point::new(32, 0));
         im.draw(&mut display).unwrap();
 
-        display.flush().unwrap();
+        if let Err(_) = display.flush() {
+            info!("Failed to update display");
+        }
     }
 }
 
@@ -117,13 +119,16 @@ async fn config_handler(cmd: &str) {
                           - i<x>            : clear interrupt index x\r\n\
                           - v               : firmware and board information\r\n";
 
-    let fw_str: &'static str = "\r\n====== emonHP ======\r\n\
-          - Firmware    : v0.1.0\r\n\
+    let fw_str: &'static str = concat!(
+        "\r\n====== emonHP ======\r\n\
+          - Firmware    : v",
+        env!("CARGO_PKG_VERSION"),
+        "\r\n\
           - Board       : emonHP1 (arch. rev. 1)\r\n\r\n\
           - emonHP Copyright (C) 2026 Angus Logan\r\n\
           - Distributed under GPL3 license, see COPYING.md\r\n\
-          - See CONTRIBUTORS.md\r\n\
-          - For Bear and Moose";
+          - For Bear and Moose\r\n"
+    );
 
     match cmd.as_bytes() {
         b"?" => {
@@ -161,6 +166,7 @@ async fn config_handler(cmd: &str) {
             ) {
                 MBUSSTATE.store(MBusState::as_u32(MBusState::Enabled), Relaxed);
             }
+            MBUS_SIG.signal(());
         }
         b"i" => {
             // Very basic handler [4] is MBus overcurrent, [0] is BOOT
@@ -188,7 +194,11 @@ async fn config_handler(cmd: &str) {
         b"v" => {
             UART_TX_CH.send(UartTxMsg::Static(fw_str.as_bytes())).await;
         }
-        _ => {}
+        _ => {
+            UART_TX_CH
+                .send(UartTxMsg::Static(b"> Unknown command.\r\n"))
+                .await
+        }
     }
 }
 
@@ -210,6 +220,7 @@ async fn uart_tx_task(mut uart_tx: BufferedUartTx<'static>) {
 async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
     let mut ln = heapless::String::<64>::new();
     let mut byte = [0u8, 1];
+    let mut overflowed = false;
 
     loop {
         match uart_rx.read(&mut byte).await {
@@ -224,17 +235,28 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
 
         match ch {
             b'\n' => {
-                config_handler(ln.as_str()).await;
+                if overflowed {
+                    UART_TX_CH
+                        .send(UartTxMsg::Static(b"> Command too long"))
+                        .await;
+                } else {
+                    if ln.ends_with('\r') {
+                        ln.pop();
+                    }
+                    config_handler(ln.as_str()).await;
+                }
+                ln.clear();
+                overflowed = false;
             }
 
             // Handle delete and backspace
-            8 | 127 => {
+            8 | 127 if !overflowed => {
                 if ln.pop().is_some() {
                     UART_TX_CH.send(UartTxMsg::Static(b"\x08 \x08")).await;
                 }
             }
 
-            b if b.is_ascii() => {
+            b if b.is_ascii() && !overflowed => {
                 let _ = ln.push(b as char);
             }
 
