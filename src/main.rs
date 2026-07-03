@@ -3,9 +3,11 @@
 
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::{AtomicBool, AtomicU32};
+use core::future::pending;
 
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::i2c::I2c;
@@ -16,6 +18,7 @@ use embassy_stm32::{bind_interrupts, interrupt};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer};
 use embedded_graphics::Drawable;
 use embedded_graphics::geometry::Point;
 use embedded_graphics::image::{Image, ImageRaw};
@@ -302,6 +305,45 @@ async fn mbus_en_handler(mut mbus_en: Output<'static>) {
 }
 
 #[embassy_executor::task]
+async fn mbus_led_handler(mut mbus_led_g: Output<'static>, mut mbus_led_r: Output<'static>) {
+    // LED: ENABLED -> GREEN; DISABLED -> YELLOW; OVERCURRENT -> FLASHING RED.
+    // LEDs are active LOW.
+    loop {
+
+        // Create flashing timer if over current. If not in over current, future won't expire.
+        let t_flash = async {
+            if MBusState::from_u32(MBUSSTATE.load(Relaxed)) == MBusState::OverCurrentError {
+                Timer::after(Duration::from_millis(250)).await;
+            } else {
+                pending::<()>().await;
+            }
+        };
+
+        match select(MBUS_SIG.wait(), t_flash).await {
+            Either::First(()) => {
+                match MBusState::from_u32(MBUSSTATE.load(Relaxed)) {
+                    MBusState::Disabled => {
+                        mbus_led_g.set_low();
+                        mbus_led_r.set_low();
+                    }
+                    MBusState::Enabled => {
+                        mbus_led_g.set_low();
+                        mbus_led_r.set_high();
+                    }
+                    MBusState::OverCurrentError => {
+                        mbus_led_g.set_high();
+                        mbus_led_r.set_low();
+                    }
+                }
+            }
+            Either::Second(()) => {
+                mbus_led_r.toggle();
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
 async fn mbus_oc_handler(mut mbus_oc: ExtiInput<'static, Async>) {
     loop {
         mbus_oc.wait_for_rising_edge().await;
@@ -329,6 +371,8 @@ async fn main(_spawner: Spawner) {
 
     let mbus_oc = ExtiInput::new(p.PB0, p.EXTI0, Pull::Down, Irqs);
     let mbus_en = Output::new(p.PB1, Level::Low, Speed::Low);
+    let mbus_led_g = Output::new(p.PB4, Level::Low, Speed::Low);
+    let mbus_led_r = Output::new(p.PB5, Level::Low, Speed::Low);
 
     /* Initialise UART. Split into Rx and Tx parts for different tasks
       REVISIT : USART1 and PB7 (rx) and PB6 (tx) for real board
@@ -357,6 +401,7 @@ async fn main(_spawner: Spawner) {
     _spawner.spawn(interrupt_handler(p.PA12)).unwrap();
     _spawner.spawn(mbus_oc_handler(mbus_oc)).unwrap();
     _spawner.spawn(mbus_en_handler(mbus_en)).unwrap();
+    _spawner.spawn(mbus_led_handler(mbus_led_g, mbus_led_r)).unwrap();
     _spawner.spawn(uart_tx_task(uart_tx)).unwrap();
     _spawner.spawn(uart_rx_task(uart_rx)).unwrap();
 
