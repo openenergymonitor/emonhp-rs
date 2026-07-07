@@ -1,13 +1,13 @@
 #![no_std]
 #![no_main]
 
+use core::future::pending;
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::{AtomicBool, AtomicU32};
-use core::future::pending;
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::i2c::I2c;
@@ -62,8 +62,9 @@ static UART_TX_CH: Channel<CriticalSectionRawMutex, UartTxMsg, 2> = Channel::new
 static UART_TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
 static UART_RX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 
-static MBUS_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-static MBUSSTATE: AtomicU32 = AtomicU32::new(MBusState::Disabled as u32);
+static MBUS_EN_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static MBUS_LED_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static MBUS_STATE: AtomicU32 = AtomicU32::new(MBusState::Disabled as u32);
 
 static IRQ_CH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static BOOT_IND: AtomicBool = AtomicBool::new(true);
@@ -98,7 +99,7 @@ fn display_boot(
     let res = display.init();
 
     info!("Initialising SSD1306...");
-    if let Err(_) = res {
+    if res.is_err() {
         info!("  - Failed.");
     } else {
         info!("  - Success.");
@@ -107,7 +108,7 @@ fn display_boot(
         let im = Image::new(&raw, Point::new(32, 0));
         im.draw(&mut display).unwrap();
 
-        if let Err(_) = display.flush() {
+        if display.flush().is_err() {
             info!("Failed to update display");
         }
     }
@@ -141,7 +142,7 @@ async fn config_handler(cmd: &str) {
         }
         b"b" => {
             UART_TX_CH.send(UartTxMsg::Static(b"> MBus status: ")).await;
-            match MBusState::from_u32(MBUSSTATE.load(Relaxed)) {
+            match MBusState::from_u32(MBUS_STATE.load(Relaxed)) {
                 MBusState::OverCurrentError => {
                     UART_TX_CH
                         .send(UartTxMsg::Static(b"Over Current Error\r\n"))
@@ -156,24 +157,22 @@ async fn config_handler(cmd: &str) {
             }
         }
         b"b0" => {
-            let mbs = MBUSSTATE.load(Relaxed);
+            let mbs = MBUS_STATE.load(Relaxed);
             if MBusState::from_u32(mbs) == MBusState::Enabled {
-                MBUSSTATE.store(MBusState::as_u32(MBusState::Disabled), Relaxed);
-                MBUS_SIG.signal(());
+                set_mbus_state(MBusState::Disabled);
             }
         }
         b"b1" => {
             if matches!(
-                MBusState::from_u32(MBUSSTATE.load(Relaxed)),
+                MBusState::from_u32(MBUS_STATE.load(Relaxed)),
                 MBusState::Disabled | MBusState::OverCurrentError
             ) {
-                MBUSSTATE.store(MBusState::as_u32(MBusState::Enabled), Relaxed);
+                set_mbus_state(MBusState::Enabled);
             }
-            MBUS_SIG.signal(());
         }
         b"i" => {
             // Very basic handler [4] is MBus overcurrent, [0] is BOOT
-            if MBusState::from_u32(MBUSSTATE.load(Relaxed)) == MBusState::OverCurrentError {
+            if MBusState::from_u32(MBUS_STATE.load(Relaxed)) == MBusState::OverCurrentError {
                 UART_TX_CH.send(UartTxMsg::Echo(b'1')).await;
             } else {
                 UART_TX_CH.send(UartTxMsg::Echo(b'0')).await;
@@ -191,7 +190,7 @@ async fn config_handler(cmd: &str) {
             IRQ_CH.signal(());
         }
         b"i4" => {
-            MBUSSTATE.store(MBusState::as_u32(MBusState::Disabled), Relaxed);
+            set_mbus_state(MBusState::Disabled);
             IRQ_CH.signal(());
         }
         b"v" => {
@@ -203,6 +202,12 @@ async fn config_handler(cmd: &str) {
                 .await
         }
     }
+}
+
+fn set_mbus_state(state: MBusState) {
+    MBUS_STATE.store(state.as_u32(), Relaxed);
+    MBUS_EN_SIG.signal(());
+    MBUS_LED_SIG.signal(());
 }
 
 #[embassy_executor::task]
@@ -222,7 +227,7 @@ async fn uart_tx_task(mut uart_tx: BufferedUartTx<'static>) {
 #[embassy_executor::task]
 async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
     let mut ln = heapless::String::<64>::new();
-    let mut byte = [0u8, 1];
+    let mut byte = [0u8; 1];
     let mut overflowed = false;
 
     loop {
@@ -240,7 +245,7 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
             b'\n' => {
                 if overflowed {
                     UART_TX_CH
-                        .send(UartTxMsg::Static(b"> Command too long"))
+                        .send(UartTxMsg::Static(b"> Command too long\r\n"))
                         .await;
                 } else {
                     if ln.ends_with('\r') {
@@ -260,7 +265,9 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
             }
 
             b if b.is_ascii() && !overflowed => {
-                let _ = ln.push(b as char);
+                if ln.push(b as char).is_err() {
+                    overflowed = true;
+                }
             }
 
             _ => {}
@@ -274,13 +281,13 @@ async fn interrupt_handler(irq: embassy_stm32::Peri<'static, embassy_stm32::peri
     let mut irq = Output::new(irq, Level::High, Speed::Low);
 
     loop {
-        while !((MBusState::from_u32(MBUSSTATE.load(Relaxed)) == MBusState::OverCurrentError)
+        while !((MBusState::from_u32(MBUS_STATE.load(Relaxed)) == MBusState::OverCurrentError)
             || BOOT_IND.load(Relaxed))
         {
             IRQ_CH.wait().await;
         }
         irq.set_high();
-        while (MBusState::from_u32(MBUSSTATE.load(Relaxed)) == MBusState::OverCurrentError)
+        while (MBusState::from_u32(MBUS_STATE.load(Relaxed)) == MBusState::OverCurrentError)
             || BOOT_IND.load(Relaxed)
         {
             IRQ_CH.wait().await;
@@ -292,8 +299,8 @@ async fn interrupt_handler(irq: embassy_stm32::Peri<'static, embassy_stm32::peri
 #[embassy_executor::task]
 async fn mbus_en_handler(mut mbus_en: Output<'static>) {
     loop {
-        MBUS_SIG.wait().await;
-        match MBusState::from_u32(MBUSSTATE.load(Relaxed)) {
+        MBUS_EN_SIG.wait().await;
+        match MBusState::from_u32(MBUS_STATE.load(Relaxed)) {
             MBusState::Disabled | MBusState::OverCurrentError => {
                 mbus_en.set_low();
             }
@@ -309,33 +316,30 @@ async fn mbus_led_handler(mut mbus_led_g: Output<'static>, mut mbus_led_r: Outpu
     // LED: ENABLED -> GREEN; DISABLED -> YELLOW; OVERCURRENT -> FLASHING RED.
     // LEDs are active LOW.
     loop {
-
         // Create flashing timer if over current. If not in over current, future won't expire.
         let t_flash = async {
-            if MBusState::from_u32(MBUSSTATE.load(Relaxed)) == MBusState::OverCurrentError {
+            if MBusState::from_u32(MBUS_STATE.load(Relaxed)) == MBusState::OverCurrentError {
                 Timer::after(Duration::from_millis(250)).await;
             } else {
                 pending::<()>().await;
             }
         };
 
-        match select(MBUS_SIG.wait(), t_flash).await {
-            Either::First(()) => {
-                match MBusState::from_u32(MBUSSTATE.load(Relaxed)) {
-                    MBusState::Disabled => {
-                        mbus_led_g.set_low();
-                        mbus_led_r.set_low();
-                    }
-                    MBusState::Enabled => {
-                        mbus_led_g.set_low();
-                        mbus_led_r.set_high();
-                    }
-                    MBusState::OverCurrentError => {
-                        mbus_led_g.set_high();
-                        mbus_led_r.set_low();
-                    }
+        match select(MBUS_LED_SIG.wait(), t_flash).await {
+            Either::First(()) => match MBusState::from_u32(MBUS_STATE.load(Relaxed)) {
+                MBusState::Disabled => {
+                    mbus_led_g.set_low();
+                    mbus_led_r.set_low();
                 }
-            }
+                MBusState::Enabled => {
+                    mbus_led_g.set_low();
+                    mbus_led_r.set_high();
+                }
+                MBusState::OverCurrentError => {
+                    mbus_led_g.set_high();
+                    mbus_led_r.set_low();
+                }
+            },
             Either::Second(()) => {
                 mbus_led_r.toggle();
             }
@@ -347,14 +351,13 @@ async fn mbus_led_handler(mut mbus_led_g: Output<'static>, mut mbus_led_r: Outpu
 async fn mbus_oc_handler(mut mbus_oc: ExtiInput<'static, Async>) {
     loop {
         mbus_oc.wait_for_rising_edge().await;
-        MBUSSTATE.store(MBusState::OverCurrentError.as_u32(), Relaxed);
-        MBUS_SIG.signal(());
+        set_mbus_state(MBusState::OverCurrentError);
         IRQ_CH.signal(());
     }
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     info!("Hello emonHP!");
 
@@ -398,12 +401,14 @@ async fn main(_spawner: Spawner) {
     // Drive !FW pin LOW to indicate working firmware
     let _ = Output::new(p.PB3, Level::Low, Speed::Low);
 
-    _spawner.spawn(interrupt_handler(p.PA12)).unwrap();
-    _spawner.spawn(mbus_oc_handler(mbus_oc)).unwrap();
-    _spawner.spawn(mbus_en_handler(mbus_en)).unwrap();
-    _spawner.spawn(mbus_led_handler(mbus_led_g, mbus_led_r)).unwrap();
-    _spawner.spawn(uart_tx_task(uart_tx)).unwrap();
-    _spawner.spawn(uart_rx_task(uart_rx)).unwrap();
+    spawner.spawn(interrupt_handler(p.PA12)).unwrap();
+    spawner.spawn(mbus_oc_handler(mbus_oc)).unwrap();
+    spawner.spawn(mbus_en_handler(mbus_en)).unwrap();
+    spawner
+        .spawn(mbus_led_handler(mbus_led_g, mbus_led_r))
+        .unwrap();
+    spawner.spawn(uart_tx_task(uart_tx)).unwrap();
+    spawner.spawn(uart_rx_task(uart_rx)).unwrap();
 
     config_handler("v").await;
 
