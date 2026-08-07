@@ -74,13 +74,13 @@ bind_interrupts!(
         EXTI0_1 => exti::InterruptHandler<interrupt::typelevel::EXTI0_1>;
         EXTI4_15 => exti::InterruptHandler<interrupt::typelevel::EXTI4_15>;
 
-        USART2 => embassy_stm32::usart::BufferedInterruptHandler<embassy_stm32::peripherals::USART2>;
+        USART1 => embassy_stm32::usart::BufferedInterruptHandler<embassy_stm32::peripherals::USART1>;
 });
 
 fn display_boot(
     i2c: embassy_stm32::Peri<'static, embassy_stm32::peripherals::I2C1>,
-    scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB8>,
-    sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB9>,
+    scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA9>,
+    sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA10>,
 ) {
     /* Set image + text on the OLED
        REVISIT : PA9/PA10 for real board
@@ -361,32 +361,29 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     info!("Hello emonHP!");
 
-    /* emonHP board specific resets for bring up */
-    // DHW
-    // let _opa1 = Input::new(p.PA2, Pull::Down);
-    // let _opa1_pu = Input::new(p.PA3, Pull::None);
-    // // Pulse counting; soft pull down.
+    // DHW; soft pull down.
+    let _opa1 = Input::new(p.PA2, Pull::Down);
+    let _opa1_pu = Input::new(p.PA3, Pull::None);
+    // Pulse counting; soft pull down.
     let _opa2 = Input::new(p.PA4, Pull::Down);
     let _opa2_pu = Input::new(p.PA5, Pull::None);
-    // // OneWire; hard pull up.
+    // OneWire; hard pull up.
     let _opa3 = Input::new(p.PA6, Pull::None);
     let _opa3_pu = Output::new(p.PA7, Level::High, Speed::Low);
 
     let mbus_oc = ExtiInput::new(p.PB0, p.EXTI0, Pull::Down, Irqs);
     let mbus_en = Output::new(p.PB1, Level::Low, Speed::Low);
-    let mbus_led_g = Output::new(p.PB4, Level::Low, Speed::Low);
-    let mbus_led_r = Output::new(p.PB5, Level::Low, Speed::Low);
+    let mbus_led_g = Output::new(p.PB5, Level::Low, Speed::Low);
+    let mbus_led_r = Output::new(p.PB4, Level::Low, Speed::Low);
 
-    /* Initialise UART. Split into Rx and Tx parts for different tasks
-      REVISIT : USART1 and PB7 (rx) and PB6 (tx) for real board
-    */
+    /* Initialise UART. Split into Rx and Tx parts for different tasks */
     let mut uart_cfg = embassy_stm32::usart::Config::default();
     uart_cfg.baudrate = 115_200;
-    // let mut uart = Uart::new_blocking(p.USART2, p.PA3, p.PA2, uart_cfg).unwrap();
+
     let uart = BufferedUart::new(
-        p.USART2,
-        p.PA3,
-        p.PA2,
+        p.USART1,
+        p.PB7,
+        p.PB6,
         UART_TX_BUF.init([0; 512]),
         UART_RX_BUF.init([0; 64]),
         Irqs,
@@ -396,10 +393,7 @@ async fn main(spawner: Spawner) {
 
     let (uart_tx, uart_rx) = uart.split();
 
-    display_boot(p.I2C1, p.PB8, p.PB9);
-
-    // Drive !FW pin LOW to indicate working firmware
-    let _ = Output::new(p.PB3, Level::Low, Speed::Low);
+    display_boot(p.I2C1, p.PA9, p.PA10);
 
     spawner.spawn(interrupt_handler(p.PA12)).unwrap();
     spawner.spawn(mbus_oc_handler(mbus_oc)).unwrap();
@@ -409,6 +403,9 @@ async fn main(spawner: Spawner) {
         .unwrap();
     spawner.spawn(uart_tx_task(uart_tx)).unwrap();
     spawner.spawn(uart_rx_task(uart_rx)).unwrap();
+
+    // Drive !FW pin LOW to indicate working firmware
+    let _fw = Output::new(p.PB3, Level::Low, Speed::Low);
 
     config_handler("v").await;
 
