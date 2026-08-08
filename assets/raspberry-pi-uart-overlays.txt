@@ -1,0 +1,24 @@
+# Raspberry Pi /boot/firmware/config.txt overlay snippet
+#
+# Pi 4:
+#   UART3: TXD3 GPIO4, RXD3 GPIO5, CTS3 GPIO6, RTS3 GPIO7
+#   UART5: TXD5 GPIO12, RXD5 GPIO13
+#
+# Pi 5:
+#   UART3: TXD3 GPIO8, RXD3 GPIO9, CTS3 GPIO10, RTS3 GPIO11
+#   There is no UART5 on Raspberry Pi 5. Use UART4 on GPIO12/13 for the
+#   same two header GPIOs used by UART5 TX/RX on Pi 4.
+#
+# The rs485 parameter enables RS485 mode and the UART CTS/RTS pins needed for
+# RTS-driven transceiver direction control. UART5/UART4 below omit ctsrts for
+# a simple bidirectional UART with no flow control.
+
+[pi4]
+dtoverlay=uart3,rs485
+dtoverlay=uart5
+
+[pi5]
+dtoverlay=uart3-pi5,rs485
+dtoverlay=uart4-pi5
+
+[all]
