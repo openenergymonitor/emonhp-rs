@@ -9,9 +9,9 @@ This contains the firmware for the [emonHP](https://github.com/openenergymonitor
 
 ### Raspberry Pi
 
-After cloning the repository, in `scripts/` run `sudo setup_pi.sh`. This will enable thr 
+After cloning the repository, in `scripts/` run `sudo setup_pi.sh`. This will enable the required UART instances on the GPIO header. You will need to restart the Pi for this to take effect.
 
-### emonHP Firmware
+### Microcontroller Firmware
 
 > [!TIP]
 > Most users will use pre-built binaries from releases. You only need to compile from source for features or fixes that are not in a release, or if you developing the firmware.
@@ -20,8 +20,8 @@ After cloning the repository, in `scripts/` run `sudo setup_pi.sh`. This will en
 
 When you have the firmware binary available:
 
-- If you have the Raspberry Pi attached to the GPIO pins, in `script` run `flash_pi.sh <path to .elf>`.
-- If you have an external debugger, run `openocd -f openocd.cfg -c program <path to .elf> verify reset exit`.
+- If you have the Raspberry Pi attached to the GPIO pins, in `scripts` run `flash_pi.sh <path to .elf>`.
+- If you are using an external debugger, run `openocd -f openocd.cfg -c program <path to .elf> verify reset exit`.
 
 #### Compiling
 
@@ -30,7 +30,7 @@ You will need to have the [Rust compiler installed](https://rust-lang.org/tools/
 To build the firmware, run `cargo build`. This will build the debug version of the firmware. To build the release version, run `cargo build --release`.
 
 > [!TIP]
-> It is strongly recommended to compile the firmware on a reasonably power device. While it is possible to compile on the Raspberry Pi, it will take around 10-15 minutes on the Raspberry Pi 4 with 1 GB.
+> It is strongly recommended to compile the firmware on a reasonably powerful device. While it is possible to compile on the Raspberry Pi, it will take around 10-15 minutes on a Raspberry Pi 4 with 1 GB of RAM.
 
 ## Getting in contact
 

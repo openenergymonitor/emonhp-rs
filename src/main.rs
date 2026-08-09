@@ -12,8 +12,10 @@ use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::i2c::I2c;
 use embassy_stm32::mode::Async;
+use embassy_stm32::peripherals::IWDG;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{BufferedUart, BufferedUartRx, BufferedUartTx};
+use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{bind_interrupts, interrupt};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -77,43 +79,6 @@ bind_interrupts!(
         USART1 => embassy_stm32::usart::BufferedInterruptHandler<embassy_stm32::peripherals::USART1>;
 });
 
-fn display_boot(
-    i2c: embassy_stm32::Peri<'static, embassy_stm32::peripherals::I2C1>,
-    scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA9>,
-    sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA10>,
-) {
-    /* Set image + text on the OLED
-       REVISIT : PA9/PA10 for real board
-    */
-    let mut i2c_cfg = embassy_stm32::i2c::Config::default();
-    i2c_cfg.frequency = Hertz(400_000);
-    let i2c = I2c::new_blocking(i2c, scl, sda, i2c_cfg);
-
-    let ssd_interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306::new(
-        ssd_interface,
-        DisplaySize128x64,
-        ssd1306::rotation::DisplayRotation::Rotate0,
-    )
-    .into_buffered_graphics_mode();
-    let res = display.init();
-
-    info!("Initialising SSD1306...");
-    if res.is_err() {
-        info!("  - Failed.");
-    } else {
-        info!("  - Success.");
-
-        let raw: ImageRaw<BinaryColor> = ImageRaw::new(include_bytes!("./rust.raw"), 64);
-        let im = Image::new(&raw, Point::new(32, 0));
-        im.draw(&mut display).unwrap();
-
-        if display.flush().is_err() {
-            info!("Failed to update display");
-        }
-    }
-}
-
 async fn config_handler(cmd: &str) {
     let help_str: &'static str = "====== emonHP ======\r\n\
                           - ?               : Print this message again\r\n\
@@ -159,7 +124,7 @@ async fn config_handler(cmd: &str) {
         b"b0" => {
             let mbs = MBUS_STATE.load(Relaxed);
             if MBusState::from_u32(mbs) == MBusState::Enabled {
-                set_mbus_state(MBusState::Disabled);
+                mbus_set_state(MBusState::Disabled);
             }
         }
         b"b1" => {
@@ -167,7 +132,7 @@ async fn config_handler(cmd: &str) {
                 MBusState::from_u32(MBUS_STATE.load(Relaxed)),
                 MBusState::Disabled | MBusState::OverCurrentError
             ) {
-                set_mbus_state(MBusState::Enabled);
+                mbus_set_state(MBusState::Enabled);
             }
         }
         b"i" => {
@@ -190,7 +155,7 @@ async fn config_handler(cmd: &str) {
             IRQ_CH.signal(());
         }
         b"i4" => {
-            set_mbus_state(MBusState::Disabled);
+            mbus_set_state(MBusState::Disabled);
             IRQ_CH.signal(());
         }
         b"v" => {
@@ -204,73 +169,37 @@ async fn config_handler(cmd: &str) {
     }
 }
 
-fn set_mbus_state(state: MBusState) {
-    MBUS_STATE.store(state.as_u32(), Relaxed);
-    MBUS_EN_SIG.signal(());
-    MBUS_LED_SIG.signal(());
-}
+fn display_boot(
+    i2c: embassy_stm32::Peri<'static, embassy_stm32::peripherals::I2C1>,
+    scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA9>,
+    sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA10>,
+) {
+    /* Set image + text on the OLED */
+    let mut i2c_cfg = embassy_stm32::i2c::Config::default();
+    i2c_cfg.frequency = Hertz(400_000);
+    let i2c = I2c::new_blocking(i2c, scl, sda, i2c_cfg);
 
-#[embassy_executor::task]
-async fn uart_tx_task(mut uart_tx: BufferedUartTx<'static>) {
-    loop {
-        let res = match UART_TX_CH.receive().await {
-            UartTxMsg::Echo(byte) => uart_tx.write_all(&[byte]).await,
-            UartTxMsg::Static(bytes) => uart_tx.write_all(bytes).await,
-        };
+    let ssd_interface = I2CDisplayInterface::new(i2c);
+    let mut display = Ssd1306::new(
+        ssd_interface,
+        DisplaySize128x64,
+        ssd1306::rotation::DisplayRotation::Rotate0,
+    )
+    .into_buffered_graphics_mode();
+    let res = display.init();
 
-        if res.is_ok() {
-            let _ = uart_tx.flush().await;
-        }
-    }
-}
+    info!("Initialising SSD1306...");
+    if res.is_err() {
+        info!("  - Failed.");
+    } else {
+        info!("  - Success.");
 
-#[embassy_executor::task]
-async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
-    let mut ln = heapless::String::<64>::new();
-    let mut byte = [0u8; 1];
-    let mut overflowed = false;
+        let raw: ImageRaw<BinaryColor> = ImageRaw::new(include_bytes!("./rust.raw"), 64);
+        let im = Image::new(&raw, Point::new(32, 0));
+        im.draw(&mut display).unwrap();
 
-    loop {
-        match uart_rx.read(&mut byte).await {
-            Ok(1) => {}
-            Ok(_) | Err(_) => continue,
-        }
-
-        let ch = byte[0];
-        if ch.is_ascii_alphanumeric() {
-            UART_TX_CH.send(UartTxMsg::Echo(ch)).await;
-        }
-
-        match ch {
-            b'\n' => {
-                if overflowed {
-                    UART_TX_CH
-                        .send(UartTxMsg::Static(b"> Command too long\r\n"))
-                        .await;
-                } else {
-                    if ln.ends_with('\r') {
-                        ln.pop();
-                    }
-                    config_handler(ln.as_str()).await;
-                }
-                ln.clear();
-                overflowed = false;
-            }
-
-            // Handle delete and backspace
-            8 | 127 if !overflowed => {
-                if ln.pop().is_some() {
-                    UART_TX_CH.send(UartTxMsg::Static(b"\x08 \x08")).await;
-                }
-            }
-
-            b if b.is_ascii() && !overflowed => {
-                if ln.push(b as char).is_err() {
-                    overflowed = true;
-                }
-            }
-
-            _ => {}
+        if display.flush().is_err() {
+            info!("Failed to update display");
         }
     }
 }
@@ -351,8 +280,88 @@ async fn mbus_led_handler(mut mbus_led_g: Output<'static>, mut mbus_led_r: Outpu
 async fn mbus_oc_handler(mut mbus_oc: ExtiInput<'static, Async>) {
     loop {
         mbus_oc.wait_for_rising_edge().await;
-        set_mbus_state(MBusState::OverCurrentError);
+        mbus_set_state(MBusState::OverCurrentError);
         IRQ_CH.signal(());
+    }
+}
+
+fn mbus_set_state(state: MBusState) {
+    MBUS_STATE.store(state.as_u32(), Relaxed);
+    MBUS_EN_SIG.signal(());
+    MBUS_LED_SIG.signal(());
+}
+
+#[embassy_executor::task]
+async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
+    let mut ln = heapless::String::<64>::new();
+    let mut byte = [0u8; 1];
+    let mut overflowed = false;
+
+    loop {
+        match uart_rx.read(&mut byte).await {
+            Ok(1) => {}
+            Ok(_) | Err(_) => continue,
+        }
+
+        let ch = byte[0];
+        if ch.is_ascii_alphanumeric() {
+            UART_TX_CH.send(UartTxMsg::Echo(ch)).await;
+        }
+
+        match ch {
+            b'\n' => {
+                if overflowed {
+                    UART_TX_CH
+                        .send(UartTxMsg::Static(b"> Command too long\r\n"))
+                        .await;
+                } else {
+                    if ln.ends_with('\r') {
+                        ln.pop();
+                    }
+                    config_handler(ln.as_str()).await;
+                }
+                ln.clear();
+                overflowed = false;
+            }
+
+            // Handle delete and backspace
+            8 | 127 if !overflowed => {
+                if ln.pop().is_some() {
+                    UART_TX_CH.send(UartTxMsg::Static(b"\x08 \x08")).await;
+                }
+            }
+
+            b if b.is_ascii() && !overflowed => {
+                if ln.push(b as char).is_err() {
+                    overflowed = true;
+                }
+            }
+
+            _ => {}
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn uart_tx_task(mut uart_tx: BufferedUartTx<'static>) {
+    loop {
+        let res = match UART_TX_CH.receive().await {
+            UartTxMsg::Echo(byte) => uart_tx.write_all(&[byte]).await,
+            UartTxMsg::Static(bytes) => uart_tx.write_all(bytes).await,
+        };
+
+        if res.is_ok() {
+            let _ = uart_tx.flush().await;
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn wdt_handler(mut wdt: IndependentWatchdog<'static, IWDG>) {
+    wdt.unleash();
+    loop {
+        Timer::after_millis(250).await;
+        wdt.pet();
     }
 }
 
@@ -360,6 +369,8 @@ async fn mbus_oc_handler(mut mbus_oc: ExtiInput<'static, Async>) {
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     info!("Hello emonHP!");
+
+    let wdt = IndependentWatchdog::new(p.IWDG, 1_000_000);
 
     // DHW; soft pull down.
     let _opa1 = Input::new(p.PA2, Pull::Down);
@@ -392,6 +403,8 @@ async fn main(spawner: Spawner) {
     .unwrap();
 
     let (uart_tx, uart_rx) = uart.split();
+
+    spawner.spawn(wdt_handler(wdt)).unwrap();
 
     display_boot(p.I2C1, p.PA9, p.PA10);
 
