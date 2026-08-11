@@ -194,7 +194,7 @@ fn display_boot(
     } else {
         info!("  - Success.");
 
-        let raw: ImageRaw<BinaryColor> = ImageRaw::new(include_bytes!("./rust.raw"), 64);
+        let raw: ImageRaw<BinaryColor> = ImageRaw::new(include_bytes!("./emonhp_64x64.raw"), 64);
         let im = Image::new(&raw, Point::new(32, 0));
         im.draw(&mut display).unwrap();
 
