@@ -2,10 +2,9 @@
 #![no_main]
 
 use core::future::pending;
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::Relaxed;
-use core::sync::atomic::{AtomicBool, AtomicU32};
 
-use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_stm32::exti::{self, ExtiInput};
@@ -30,7 +29,28 @@ use ssd1306::mode::DisplayConfig;
 use ssd1306::size::DisplaySize128x64;
 use ssd1306::{I2CDisplayInterface, Ssd1306};
 use static_cell::StaticCell;
-use {defmt_rtt as _, panic_probe as _};
+
+#[cfg(feature = "defmt")]
+use defmt_rtt as _;
+use panic_probe as _;
+
+#[cfg(feature = "defmt")]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        defmt::info!($($arg)*)
+    };
+}
+
+#[cfg(not(feature = "defmt"))]
+macro_rules! log_info {
+    ($($arg:tt)*) => {};
+}
+
+const UART_BAUD: u32 = 115_200;
+const UART_TX_BUF_LEN: usize = 512;
+const UART_RX_BUF_LEN: usize = 64;
+const MBUS_FAULT_FLASH_MS: u64 = 250;
+const OLED_I2C_FREQ: Hertz = Hertz(400_000);
 
 enum UartTxMsg {
     Echo(u8),
@@ -40,36 +60,53 @@ enum UartTxMsg {
 #[repr(u32)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum MBusState {
-    Disabled = 0,
-    Enabled = 1,
-    OverCurrentError = 2,
+    Disabled,
+    Enabled,
+    OverCurrentError,
 }
 
-impl MBusState {
-    fn as_u32(self) -> u32 {
-        self as u32
+struct AtomicMbusState(AtomicU32);
+
+impl AtomicMbusState {
+    const fn new(state: MBusState) -> Self {
+        Self(AtomicU32::new(Self::encode(state)))
     }
 
-    fn from_u32(value: u32) -> Self {
+    fn load(&self) -> MBusState {
+        Self::decode(self.0.load(Relaxed))
+    }
+
+    fn store(&self, state: MBusState) {
+        self.0.store(Self::encode(state), Relaxed);
+    }
+
+    const fn encode(state: MBusState) -> u32 {
+        match state {
+            MBusState::Disabled => 0,
+            MBusState::Enabled => 1,
+            MBusState::OverCurrentError => 2,
+        }
+    }
+
+    fn decode(value: u32) -> MBusState {
         match value {
-            0 => Self::Disabled,
-            1 => Self::Enabled,
-            2 => Self::OverCurrentError,
-            _ => Self::Disabled,
+            0 => MBusState::Disabled,
+            1 => MBusState::Enabled,
+            2 => MBusState::OverCurrentError,
+            _ => MBusState::Disabled,
         }
     }
 }
 
 static UART_TX_CH: Channel<CriticalSectionRawMutex, UartTxMsg, 2> = Channel::new();
-static UART_TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
-static UART_RX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+static UART_TX_BUF: StaticCell<[u8; UART_TX_BUF_LEN]> = StaticCell::new();
+static UART_RX_BUF: StaticCell<[u8; UART_RX_BUF_LEN]> = StaticCell::new();
 
 static MBUS_EN_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static MBUS_LED_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-static MBUS_STATE: AtomicU32 = AtomicU32::new(MBusState::Disabled as u32);
+static MBUS_STATE: AtomicMbusState = AtomicMbusState::new(MBusState::Disabled);
 
 static IRQ_CH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-static BOOT_IND: AtomicBool = AtomicBool::new(true);
 
 bind_interrupts!(
     pub struct Irqs{
@@ -106,8 +143,8 @@ async fn config_handler(cmd: &str) {
                 .await;
         }
         b"b" => {
-            UART_TX_CH.send(UartTxMsg::Static(b"> MBus status: ")).await;
-            match MBusState::from_u32(MBUS_STATE.load(Relaxed)) {
+            UART_TX_CH.send(UartTxMsg::Static(b"> MBus: ")).await;
+            match mbus_state() {
                 MBusState::OverCurrentError => {
                     UART_TX_CH
                         .send(UartTxMsg::Static(b"Over Current Error\r\n"))
@@ -122,41 +159,39 @@ async fn config_handler(cmd: &str) {
             }
         }
         b"b0" => {
-            let mbs = MBUS_STATE.load(Relaxed);
-            if MBusState::from_u32(mbs) == MBusState::Enabled {
+            if mbus_state() == MBusState::Enabled {
                 mbus_set_state(MBusState::Disabled);
             }
+            UART_TX_CH
+                .send(UartTxMsg::Static(b"> MBus: Disabled\r\n"))
+                .await;
         }
         b"b1" => {
             if matches!(
-                MBusState::from_u32(MBUS_STATE.load(Relaxed)),
+                mbus_state(),
                 MBusState::Disabled | MBusState::OverCurrentError
             ) {
                 mbus_set_state(MBusState::Enabled);
+                UART_TX_CH
+                    .send(UartTxMsg::Static(b"> MBus: Enabled\r\n"))
+                    .await;
             }
         }
         b"i" => {
             // Very basic handler [4] is MBus overcurrent, [0] is BOOT
-            if MBusState::from_u32(MBUS_STATE.load(Relaxed)) == MBusState::OverCurrentError {
+            if mbus_state() == MBusState::OverCurrentError {
                 UART_TX_CH.send(UartTxMsg::Echo(b'1')).await;
             } else {
                 UART_TX_CH.send(UartTxMsg::Echo(b'0')).await;
             }
 
-            if BOOT_IND.load(Relaxed) {
-                UART_TX_CH.send(UartTxMsg::Echo(b'1')).await;
-            } else {
-                UART_TX_CH.send(UartTxMsg::Echo(b'0')).await;
-            }
-            UART_TX_CH.send(UartTxMsg::Static(b"\r\n")).await;
-        }
-        b"i0" => {
-            BOOT_IND.store(false, Relaxed);
-            IRQ_CH.signal(());
+            UART_TX_CH.send(UartTxMsg::Static(b"0\r\n")).await;
         }
         b"i4" => {
             mbus_set_state(MBusState::Disabled);
-            IRQ_CH.signal(());
+            UART_TX_CH
+                .send(UartTxMsg::Static(b"> MBus disabled, interrupt cleared\r\n"))
+                .await;
         }
         b"v" => {
             UART_TX_CH.send(UartTxMsg::Static(fw_str.as_bytes())).await;
@@ -176,7 +211,7 @@ fn display_boot(
 ) {
     /* Set image + text on the OLED */
     let mut i2c_cfg = embassy_stm32::i2c::Config::default();
-    i2c_cfg.frequency = Hertz(400_000);
+    i2c_cfg.frequency = OLED_I2C_FREQ;
     let i2c = I2c::new_blocking(i2c, scl, sda, i2c_cfg);
 
     let ssd_interface = I2CDisplayInterface::new(i2c);
@@ -186,20 +221,32 @@ fn display_boot(
         ssd1306::rotation::DisplayRotation::Rotate0,
     )
     .into_buffered_graphics_mode();
-    let res = display.init();
 
-    info!("Initialising SSD1306...");
-    if res.is_err() {
-        info!("  - Failed.");
-    } else {
-        info!("  - Success.");
+    log_info!("Initialising SSD1306...");
+    match display.init() {
+        Ok(_) => {
+            log_info!("  - Success.");
+            let raw: ImageRaw<BinaryColor> =
+                ImageRaw::new(include_bytes!("./emonhp_64x64.raw"), 64);
+            let im = Image::new(&raw, Point::new(32, 0));
 
-        let raw: ImageRaw<BinaryColor> = ImageRaw::new(include_bytes!("./emonhp_64x64.raw"), 64);
-        let im = Image::new(&raw, Point::new(32, 0));
-        im.draw(&mut display).unwrap();
+            match im.draw(&mut display) {
+                Ok(_) => (),
+                Err(_) => {
+                    log_info!("Failed draw image");
+                    return;
+                }
+            }
 
-        if display.flush().is_err() {
-            info!("Failed to update display");
+            match display.flush() {
+                Ok(_) => (),
+                Err(_) => {
+                    log_info!("Failed to flush display");
+                }
+            }
+        }
+        Err(_) => {
+            log_info!("  - Failed.");
         }
     }
 }
@@ -210,15 +257,11 @@ async fn interrupt_handler(irq: embassy_stm32::Peri<'static, embassy_stm32::peri
     let mut irq = Output::new(irq, Level::High, Speed::Low);
 
     loop {
-        while !((MBusState::from_u32(MBUS_STATE.load(Relaxed)) == MBusState::OverCurrentError)
-            || BOOT_IND.load(Relaxed))
-        {
+        while !(mbus_state() == MBusState::OverCurrentError) {
             IRQ_CH.wait().await;
         }
         irq.set_high();
-        while (MBusState::from_u32(MBUS_STATE.load(Relaxed)) == MBusState::OverCurrentError)
-            || BOOT_IND.load(Relaxed)
-        {
+        while mbus_state() == MBusState::OverCurrentError {
             IRQ_CH.wait().await;
         }
         irq.set_low();
@@ -229,7 +272,7 @@ async fn interrupt_handler(irq: embassy_stm32::Peri<'static, embassy_stm32::peri
 async fn mbus_en_handler(mut mbus_en: Output<'static>) {
     loop {
         MBUS_EN_SIG.wait().await;
-        match MBusState::from_u32(MBUS_STATE.load(Relaxed)) {
+        match mbus_state() {
             MBusState::Disabled | MBusState::OverCurrentError => {
                 mbus_en.set_low();
             }
@@ -247,15 +290,15 @@ async fn mbus_led_handler(mut mbus_led_g: Output<'static>, mut mbus_led_r: Outpu
     loop {
         // Create flashing timer if over current. If not in over current, future won't expire.
         let t_flash = async {
-            if MBusState::from_u32(MBUS_STATE.load(Relaxed)) == MBusState::OverCurrentError {
-                Timer::after(Duration::from_millis(250)).await;
+            if mbus_state() == MBusState::OverCurrentError {
+                Timer::after(Duration::from_millis(MBUS_FAULT_FLASH_MS)).await;
             } else {
                 pending::<()>().await;
             }
         };
 
         match select(MBUS_LED_SIG.wait(), t_flash).await {
-            Either::First(()) => match MBusState::from_u32(MBUS_STATE.load(Relaxed)) {
+            Either::First(()) => match mbus_state() {
                 MBusState::Disabled => {
                     mbus_led_g.set_low();
                     mbus_led_r.set_low();
@@ -279,16 +322,24 @@ async fn mbus_led_handler(mut mbus_led_g: Output<'static>, mut mbus_led_r: Outpu
 #[embassy_executor::task]
 async fn mbus_oc_handler(mut mbus_oc: ExtiInput<'static, Async>) {
     loop {
-        mbus_oc.wait_for_rising_edge().await;
+        mbus_oc.wait_for_falling_edge().await;
         mbus_set_state(MBusState::OverCurrentError);
-        IRQ_CH.signal(());
     }
 }
 
+fn mbus_state() -> MBusState {
+    MBUS_STATE.load()
+}
+
 fn mbus_set_state(state: MBusState) {
-    MBUS_STATE.store(state.as_u32(), Relaxed);
+    if mbus_state() == state {
+        return;
+    }
+
+    MBUS_STATE.store(state);
     MBUS_EN_SIG.signal(());
     MBUS_LED_SIG.signal(());
+    IRQ_CH.signal(());
 }
 
 #[embassy_executor::task]
@@ -304,9 +355,7 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
         }
 
         let ch = byte[0];
-        if ch.is_ascii_alphanumeric() {
-            UART_TX_CH.send(UartTxMsg::Echo(ch)).await;
-        }
+        UART_TX_CH.send(UartTxMsg::Echo(ch)).await;
 
         match ch {
             b'\n' => {
@@ -331,10 +380,8 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
                 }
             }
 
-            b if b.is_ascii() && !overflowed => {
-                if ln.push(b as char).is_err() {
-                    overflowed = true;
-                }
+            b if b.is_ascii() && !overflowed && ln.push(b as char).is_err() => {
+                overflowed = true;
             }
 
             _ => {}
@@ -368,7 +415,7 @@ async fn wdt_handler(mut wdt: IndependentWatchdog<'static, IWDG>) {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
-    info!("Hello emonHP!");
+    log_info!("Hello emonHP!");
 
     let wdt = IndependentWatchdog::new(p.IWDG, 1_000_000);
 
@@ -382,21 +429,21 @@ async fn main(spawner: Spawner) {
     let _opa3 = Input::new(p.PA6, Pull::None);
     let _opa3_pu = Output::new(p.PA7, Level::High, Speed::Low);
 
-    let mbus_oc = ExtiInput::new(p.PB0, p.EXTI0, Pull::Down, Irqs);
+    let mbus_oc = ExtiInput::new(p.PB0, p.EXTI0, Pull::Up, Irqs);
     let mbus_en = Output::new(p.PB1, Level::Low, Speed::Low);
     let mbus_led_g = Output::new(p.PB5, Level::Low, Speed::Low);
     let mbus_led_r = Output::new(p.PB4, Level::Low, Speed::Low);
 
     /* Initialise UART. Split into Rx and Tx parts for different tasks */
     let mut uart_cfg = embassy_stm32::usart::Config::default();
-    uart_cfg.baudrate = 115_200;
+    uart_cfg.baudrate = UART_BAUD;
 
     let uart = BufferedUart::new(
         p.USART1,
         p.PB7,
         p.PB6,
-        UART_TX_BUF.init([0; 512]),
-        UART_RX_BUF.init([0; 64]),
+        UART_TX_BUF.init([0; UART_TX_BUF_LEN]),
+        UART_RX_BUF.init([0; UART_RX_BUF_LEN]),
         Irqs,
         uart_cfg,
     )
@@ -419,6 +466,7 @@ async fn main(spawner: Spawner) {
 
     // Drive !FW pin LOW to indicate working firmware
     let _fw = Output::new(p.PB3, Level::Low, Speed::Low);
+    mbus_set_state(MBusState::Enabled);
 
     config_handler("v").await;
 

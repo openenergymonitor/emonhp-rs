@@ -2,7 +2,17 @@
 
 This contains the firmware for the [emonHP](https://github.com/openenergymonitor/emonhp) heatpump monitoring system.
 
-## Getting started
+## Using the firmware
+
+The emonHP has a small command set, accessible through the UART (115200, 8N1, `\n`
+line endings). The following commands are available:
+
+- `?`       : show the help text.
+- `b<x>`    : x = blank -> show MBus state, x = 1 -> MBus OFF x = 1 -> MBus ON
+- `i<x>`    : x = blank -> show interrupt state, x = `4` -> clear MBus interrupt
+- `v`       : display version information
+
+## Installing the firmware
 
 > [!NOTE]
 > If you buy a system from the [OpenEnergyMonitor shop](https://shop.openenergymonitor.org) the Raspberry Pi will be configured and the firmware installed already.
@@ -50,4 +60,3 @@ Contributions are welcome! Small PRs can be accepted at any time. Please get in 
 
 > [!NOTE]
 > Please bear in mind that this is an open source project and PRs and enhancements may not be addressed quickly, or at all. This is no comment on the quality of the contribution, and please feel free to fork as you like!
-
