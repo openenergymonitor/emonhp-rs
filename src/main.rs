@@ -347,6 +347,7 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
     let mut ln = heapless::String::<64>::new();
     let mut byte = [0u8; 1];
     let mut overflowed = false;
+    let mut ignore_lf = false;
 
     loop {
         match uart_rx.read(&mut byte).await {
@@ -358,7 +359,13 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
         UART_TX_CH.send(UartTxMsg::Echo(ch)).await;
 
         match ch {
-            b'\n' => {
+            b'\r' | b'\n' => {
+                // Accept either common line ending, but do not run CRLF twice.
+                if ch == b'\n' && ignore_lf {
+                    ignore_lf = false;
+                    continue;
+                }
+
                 if overflowed {
                     UART_TX_CH
                         .send(UartTxMsg::Static(b"> Command too long\r\n"))
@@ -371,6 +378,7 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
                 }
                 ln.clear();
                 overflowed = false;
+                ignore_lf = ch == b'\r';
             }
 
             // Handle delete and backspace
@@ -382,9 +390,12 @@ async fn uart_rx_task(mut uart_rx: BufferedUartRx<'static>) {
 
             b if b.is_ascii() && !overflowed && ln.push(b as char).is_err() => {
                 overflowed = true;
+                ignore_lf = false;
             }
 
-            _ => {}
+            _ => {
+                ignore_lf = false;
+            }
         }
     }
 }

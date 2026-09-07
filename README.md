@@ -4,8 +4,8 @@ This contains the firmware for the [emonHP](https://github.com/openenergymonitor
 
 ## Using the firmware
 
-The emonHP has a small command set, accessible through the UART (115200, 8N1, `\n`
-line endings). The following commands are available:
+The emonHP has a small command set, accessible through the UART (115200, 8N1, `\r`,
+`\n`, or `\r\n` line endings). The following commands are available:
 
 - `?`       : show the help text.
 - `b<x>`    : x = blank -> show MBus state, x = 1 -> MBus OFF x = 1 -> MBus ON
