@@ -431,8 +431,8 @@ async fn main(spawner: Spawner) {
     let wdt = IndependentWatchdog::new(p.IWDG, 1_000_000);
 
     // DHW; soft pull down.
-    let _opa1 = Input::new(p.PA2, Pull::Down);
-    let _opa1_pu = Input::new(p.PA3, Pull::None);
+    //let _opa1 = Input::new(p.PA2, Pull::Down);
+    //let _opa1_pu = Input::new(p.PA3, Pull::None);
     // Pulse counting; soft pull down.
     let _opa2 = Input::new(p.PA4, Pull::Down);
     let _opa2_pu = Input::new(p.PA5, Pull::None);
