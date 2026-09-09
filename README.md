@@ -1,4 +1,4 @@
-# emonHP Firmware
+  # emonHP Firmware
 
 This contains the firmware for the [emonHP](https://github.com/openenergymonitor/emonhp) heatpump monitoring system.
 
@@ -20,6 +20,10 @@ The emonHP has a small command set, accessible through the UART (115200, 8N1, `\
 ### Raspberry Pi
 
 After cloning the repository, in `scripts/` run `sudo setup_pi.sh`. This will enable the required UART instances on the GPIO header. You will need to restart the Pi for this to take effect.
+
+The following serial ports will then be available:
+- Modbus: `/dev/ttyAMA3`
+- MBUS: `/dev/ttyAMA5`  
 
 ### Microcontroller Firmware
 
