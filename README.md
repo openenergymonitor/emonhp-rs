@@ -39,7 +39,11 @@ When you have the firmware binary available:
 
 #### Compiling
 
-You will need to have the [Rust compiler installed](https://rust-lang.org/tools/install/).
+You will need to have the [Rust compiler installed](https://rust-lang.org/tools/install/). After installation restart shell or run `source "$HOME/.cargo/env"` to add path to current shell
+
+The STM32C031K6U used by the emonHP2 uses an ARM Cortex-M0+ core, which maps to the `thumbv6m-none-eabi` target triple so run the following to install the component:
+
+`rustup target add thumbv6m-none-eabi`
 
 To build the firmware, run `cargo build`. This will build the debug version of the firmware. To build the release version, run `cargo build --release`.
 
