@@ -1,6 +1,6 @@
   # emonHP Firmware
 
-This contains the firmware for the [emonHP](https://github.com/openenergymonitor/emonhp) heatpump monitoring system.
+This contains the firmware for the [emonHP2](https://github.com/openenergymonitor/emonhp) heatpump monitoring system.
 
 ## Using the firmware
 
