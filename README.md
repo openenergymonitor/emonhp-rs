@@ -34,8 +34,12 @@ The following serial ports will then be available:
 
 When you have the firmware binary available:
 
-- If you have the Raspberry Pi attached to the GPIO pins, in `scripts` run `flash_pi.sh <path to .elf>`.
+- If you have the Raspberry Pi attached to the GPIO pins, in `scripts` run `./flash_pi.sh <path to .elf>`.
 - If you are using an external debugger, run `openocd -f openocd.cfg -c program <path to .elf> verify reset exit`.
+
+To be able to upload `openocd` will need to be installed:
+
+`sudo apt install openocd -y`
 
 #### Compiling
 
@@ -46,6 +50,10 @@ The STM32C031K6U used by the emonHP2 uses an ARM Cortex-M0+ core, which maps to 
 `rustup target add thumbv6m-none-eabi`
 
 To build the firmware, run `cargo build`. This will build the debug version of the firmware. To build the release version, run `cargo build --release`.
+
+The release build file to upload can be found in `target/thumbv6m-none-eabi/release/emonhp-rs` this is a ELF file but without the extension, renaming it will make the workflow cleaner:
+
+`mv target/thumbv6m-none-eabi/release/emonhp-rs target/thumbv6m-none-eabi/release/emonhp-rs.elf`
 
 > [!TIP]
 > It is strongly recommended to compile the firmware on a reasonably powerful device. While it is possible to compile on the Raspberry Pi, it will take around 10-15 minutes on a Raspberry Pi 4 with 1 GB of RAM.
