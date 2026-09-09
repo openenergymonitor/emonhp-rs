@@ -30,21 +30,7 @@ use ssd1306::size::DisplaySize128x64;
 use ssd1306::{I2CDisplayInterface, Ssd1306};
 use static_cell::StaticCell;
 
-#[cfg(feature = "defmt")]
-use defmt_rtt as _;
 use panic_probe as _;
-
-#[cfg(feature = "defmt")]
-macro_rules! log_info {
-    ($($arg:tt)*) => {
-        defmt::info!($($arg)*)
-    };
-}
-
-#[cfg(not(feature = "defmt"))]
-macro_rules! log_info {
-    ($($arg:tt)*) => {};
-}
 
 const UART_BAUD: u32 = 115_200;
 const UART_TX_BUF_LEN: usize = 512;
@@ -222,10 +208,8 @@ fn display_boot(
     )
     .into_buffered_graphics_mode();
 
-    log_info!("Initialising SSD1306...");
     match display.init() {
         Ok(_) => {
-            log_info!("  - Success.");
             let raw: ImageRaw<BinaryColor> =
                 ImageRaw::new(include_bytes!("./emonhp_64x64.raw"), 64);
             let im = Image::new(&raw, Point::new(32, 0));
@@ -233,21 +217,16 @@ fn display_boot(
             match im.draw(&mut display) {
                 Ok(_) => (),
                 Err(_) => {
-                    log_info!("Failed draw image");
                     return;
                 }
             }
 
             match display.flush() {
                 Ok(_) => (),
-                Err(_) => {
-                    log_info!("Failed to flush display");
-                }
+                Err(_) => {}
             }
         }
-        Err(_) => {
-            log_info!("  - Failed.");
-        }
+        Err(_) => {}
     }
 }
 
@@ -426,7 +405,6 @@ async fn wdt_handler(mut wdt: IndependentWatchdog<'static, IWDG>) {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
-    log_info!("Hello emonHP!");
 
     let wdt = IndependentWatchdog::new(p.IWDG, 1_000_000);
 

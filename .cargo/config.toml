@@ -2,6 +2,3 @@
 runner = "probe-rs run --chip STM32C031C6"
 [build]
 target = "thumbv6m-none-eabi"
-
-[env]
-DEFMT_LOG = "info"
