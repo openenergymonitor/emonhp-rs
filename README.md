@@ -23,7 +23,7 @@ After cloning the repository, in `scripts/` run `sudo setup_pi.sh`. This will en
 
 The following serial ports will then be available:
 - Modbus: `/dev/ttyAMA3`
-- MBUS: `/dev/ttyAMA5` on Pi4, or `/dev/ttyAMA5` on Pi5  
+- MBUS: `/dev/ttyAMA5` on Pi4, or `/dev/ttyAMA4` on Pi5  
 
 ### Microcontroller Firmware
 
