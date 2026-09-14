@@ -2,32 +2,40 @@
 #![no_main]
 
 use core::future::pending;
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
-use embassy_stm32::exti::{self, ExtiInput};
-use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
-use embassy_stm32::i2c::I2c;
-use embassy_stm32::mode::Async;
-use embassy_stm32::peripherals::IWDG;
-use embassy_stm32::time::Hertz;
-use embassy_stm32::usart::{BufferedUart, BufferedUartRx, BufferedUartTx};
-use embassy_stm32::wdg::IndependentWatchdog;
-use embassy_stm32::{bind_interrupts, interrupt};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
-use embassy_sync::signal::Signal;
+
+use embassy_stm32::{
+    bind_interrupts,
+    exti::{self, ExtiInput},
+    gpio::{Input, Level, Output, Pull, Speed},
+    i2c::I2c,
+    interrupt,
+    mode::Async,
+    peripherals::IWDG,
+    time::Hertz,
+    usart::{BufferedUart, BufferedUartRx, BufferedUartTx},
+    wdg::IndependentWatchdog,
+};
+
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
+};
+
 use embassy_time::{Duration, Timer};
-use embedded_graphics::Drawable;
-use embedded_graphics::geometry::Point;
-use embedded_graphics::image::{Image, ImageRaw};
-use embedded_graphics::pixelcolor::BinaryColor;
+use embedded_graphics::{
+    Drawable,
+    geometry::Point,
+    image::{Image, ImageRaw},
+    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
+    pixelcolor::BinaryColor,
+    text::{Baseline, Text},
+};
 use embedded_io_async::{Read, Write};
-use ssd1306::mode::DisplayConfig;
-use ssd1306::size::DisplaySize128x64;
-use ssd1306::{I2CDisplayInterface, Ssd1306};
+
+use ssd1306::{I2CDisplayInterface, Ssd1306, mode::DisplayConfig, size::DisplaySize128x64};
 use static_cell::StaticCell;
 
 use panic_probe as _;
@@ -94,6 +102,9 @@ static MBUS_STATE: AtomicMbusState = AtomicMbusState::new(MBusState::Disabled);
 
 static IRQ_CH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+static SHDN_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static PWR_OFF_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 bind_interrupts!(
     pub struct Irqs{
         EXTI0_1 => exti::InterruptHandler<interrupt::typelevel::EXTI0_1>;
@@ -103,10 +114,10 @@ bind_interrupts!(
 });
 
 async fn config_handler(cmd: &str) {
-    let help_str: &'static str = "====== emonHP ======\r\n\
-                          - ?               : Print this message again\r\n\
+    let help_str: &'static str = "- ?               : Print this message again\r\n\
                           - b               : MBus regulator status\r\n\
                           - b<n>            : set MBus regulator, n = 0 OFF, n = 1 ON\r\n\
+                          - h               : power down the system\r\n
                           - i               : read interrupt status\r\n\
                           - i<x>            : clear interrupt index x\r\n\
                           - v               : firmware and board information\r\n";
@@ -146,7 +157,7 @@ async fn config_handler(cmd: &str) {
         }
         b"b0" => {
             if mbus_state() == MBusState::Enabled {
-                mbus_set_state(MBusState::Disabled);
+                mbus_state_set(MBusState::Disabled);
             }
             UART_TX_CH
                 .send(UartTxMsg::Static(b"> MBus: Disabled\r\n"))
@@ -157,14 +168,14 @@ async fn config_handler(cmd: &str) {
                 mbus_state(),
                 MBusState::Disabled | MBusState::OverCurrentError
             ) {
-                mbus_set_state(MBusState::Enabled);
+                mbus_state_set(MBusState::Enabled);
                 UART_TX_CH
                     .send(UartTxMsg::Static(b"> MBus: Enabled\r\n"))
                     .await;
             }
         }
         b"i" => {
-            // Very basic handler [4] is MBus overcurrent, [0] is BOOT
+            // Very basic handler [4] is MBus overcurrent
             if mbus_state() == MBusState::OverCurrentError {
                 UART_TX_CH.send(UartTxMsg::Echo(b'1')).await;
             } else {
@@ -174,9 +185,16 @@ async fn config_handler(cmd: &str) {
             UART_TX_CH.send(UartTxMsg::Static(b"0\r\n")).await;
         }
         b"i4" => {
-            mbus_set_state(MBusState::Disabled);
+            mbus_state_set(MBusState::Disabled);
             UART_TX_CH
                 .send(UartTxMsg::Static(b"> MBus disabled, interrupt cleared\r\n"))
+                .await;
+        }
+        b"h" => {
+            mbus_state_set(MBusState::Disabled);
+            SHDN_SIG.signal(());
+            UART_TX_CH
+                .send(UartTxMsg::Static(b"> Shutting down...\r\n"))
                 .await;
         }
         b"v" => {
@@ -190,7 +208,8 @@ async fn config_handler(cmd: &str) {
     }
 }
 
-fn display_boot(
+#[embassy_executor::task]
+async fn display_handler(
     i2c: embassy_stm32::Peri<'static, embassy_stm32::peripherals::I2C1>,
     scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA9>,
     sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA10>,
@@ -208,32 +227,100 @@ fn display_boot(
     )
     .into_buffered_graphics_mode();
 
-    match display.init() {
-        Ok(_) => {
-            let raw: ImageRaw<BinaryColor> =
-                ImageRaw::new(include_bytes!("./emonhp_64x64.raw"), 64);
-            let im = Image::new(&raw, Point::new(32, 0));
+    for _ in 0..4 {
+        let mut i2c_success = true;
+        match display.init() {
+            Ok(_) => {
+                let raw: ImageRaw<BinaryColor> =
+                    ImageRaw::new(include_bytes!("./emonhp_64x64.raw"), 64);
+                let im = Image::new(&raw, Point::new(32, 0));
 
-            match im.draw(&mut display) {
-                Ok(_) => (),
-                Err(_) => {
-                    return;
+                match im.draw(&mut display) {
+                    Ok(_) => (),
+                    Err(_) => {
+                        i2c_success = false;
+                    }
+                }
+
+                match display.flush() {
+                    Ok(_) => (),
+                    Err(_) => {
+                        i2c_success = false;
+                    }
                 }
             }
-
-            match display.flush() {
-                Ok(_) => (),
-                Err(_) => {}
+            Err(_) => {
+                i2c_success = false;
             }
         }
-        Err(_) => {}
+        if i2c_success {
+            break;
+        } else {
+            Timer::after_millis(100).await;
+        }
+    }
+
+    loop {
+        SHDN_SIG.wait().await;
+
+        let text_style = MonoTextStyleBuilder::new()
+            .font(&FONT_6X10)
+            .text_color(BinaryColor::On)
+            .build();
+
+        // Spinner style countdown for 30 s, then remove power from RPi.
+        let mut s_type: u32 = 0;
+        for _ in (1..=30).rev() {
+            display.clear_buffer();
+
+            Text::with_baseline("emonHP", Point::new(48, 0), text_style, Baseline::Top)
+                .draw(&mut display)
+                .unwrap();
+
+            Text::with_baseline(
+                "Shutting down...",
+                Point::new(10, 16),
+                text_style,
+                Baseline::Top,
+            )
+            .draw(&mut display)
+            .unwrap();
+
+            let spinner;
+            match s_type {
+                0 => spinner = "|",
+                1 => spinner = "/",
+                2 => spinner = "-",
+                3 => spinner = r"\",
+                _ => spinner = "|",
+            }
+            s_type = (s_type + 1) & 0x3;
+            Text::with_baseline(spinner, Point::new(110, 16), text_style, Baseline::Top)
+                .draw(&mut display)
+                .unwrap();
+            display.flush().unwrap();
+
+            Timer::after(Duration::from_secs(1)).await;
+        }
+
+        display.clear_buffer();
+        Text::with_baseline("emonHP", Point::new(48, 0), text_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_baseline("Shut down.", Point::new(37, 16), text_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        display.flush().unwrap();
+
+        PWR_OFF_SIG.signal(());
     }
 }
 
 #[embassy_executor::task]
 async fn interrupt_handler(irq: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA12>) {
-    // Assert interrupt high at reset to indicate need for configuration.
-    let mut irq = Output::new(irq, Level::High, Speed::Low);
+    let mut irq = Output::new(irq, Level::Low, Speed::Low);
 
     loop {
         while !(mbus_state() == MBusState::OverCurrentError) {
@@ -302,7 +389,7 @@ async fn mbus_led_handler(mut mbus_led_g: Output<'static>, mut mbus_led_r: Outpu
 async fn mbus_oc_handler(mut mbus_oc: ExtiInput<'static, Async>) {
     loop {
         mbus_oc.wait_for_falling_edge().await;
-        mbus_set_state(MBusState::OverCurrentError);
+        mbus_state_set(MBusState::OverCurrentError);
     }
 }
 
@@ -310,7 +397,7 @@ fn mbus_state() -> MBusState {
     MBUS_STATE.load()
 }
 
-fn mbus_set_state(state: MBusState) {
+fn mbus_state_set(state: MBusState) {
     if mbus_state() == state {
         return;
     }
@@ -319,6 +406,14 @@ fn mbus_set_state(state: MBusState) {
     MBUS_EN_SIG.signal(());
     MBUS_LED_SIG.signal(());
     IRQ_CH.signal(());
+}
+
+#[embassy_executor::task]
+async fn pwr_en_handler(mut pwr_en: Output<'static>) {
+    loop {
+        PWR_OFF_SIG.wait().await;
+        pwr_en.set_low();
+    }
 }
 
 #[embassy_executor::task]
@@ -408,9 +503,9 @@ async fn main(spawner: Spawner) {
 
     let wdt = IndependentWatchdog::new(p.IWDG, 1_000_000);
 
-    // DHW; soft pull down.
-    //let _opa1 = Input::new(p.PA2, Pull::Down);
-    //let _opa1_pu = Input::new(p.PA3, Pull::None);
+    // DHW; high-Z.
+    let _opa1 = Input::new(p.PA2, Pull::None);
+    let _opa1_pu = Input::new(p.PA3, Pull::None);
     // Pulse counting; soft pull down.
     let _opa2 = Input::new(p.PA4, Pull::Down);
     let _opa2_pu = Input::new(p.PA5, Pull::None);
@@ -422,6 +517,8 @@ async fn main(spawner: Spawner) {
     let mbus_en = Output::new(p.PB1, Level::Low, Speed::Low);
     let mbus_led_g = Output::new(p.PB5, Level::Low, Speed::Low);
     let mbus_led_r = Output::new(p.PB4, Level::Low, Speed::Low);
+
+    let pwr_en = Output::new(p.PB8, Level::High, Speed::Low);
 
     /* Initialise UART. Split into Rx and Tx parts for different tasks */
     let mut uart_cfg = embassy_stm32::usart::Config::default();
@@ -442,8 +539,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(wdt_handler(wdt)).unwrap();
 
-    display_boot(p.I2C1, p.PA9, p.PA10);
-
+    spawner.spawn(pwr_en_handler(pwr_en)).unwrap();
     spawner.spawn(interrupt_handler(p.PA12)).unwrap();
     spawner.spawn(mbus_oc_handler(mbus_oc)).unwrap();
     spawner.spawn(mbus_en_handler(mbus_en)).unwrap();
@@ -455,7 +551,11 @@ async fn main(spawner: Spawner) {
 
     // Drive !FW pin LOW to indicate working firmware
     let _fw = Output::new(p.PB3, Level::Low, Speed::Low);
-    mbus_set_state(MBusState::Enabled);
+    mbus_state_set(MBusState::Enabled);
+
+    spawner
+        .spawn(display_handler(p.I2C1, p.PA9, p.PA10))
+        .unwrap();
 
     config_handler("v").await;
 

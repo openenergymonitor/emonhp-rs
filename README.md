@@ -1,4 +1,4 @@
-  # emonHP Firmware
+# emonHP Firmware
 
 This contains the firmware for the [emonHP2](https://github.com/openenergymonitor/emonhp) heatpump monitoring system.
 
@@ -8,9 +8,13 @@ The emonHP has a small command set, accessible through the UART (115200, 8N1, `\
 `\n`, or `\r\n` line endings). The following commands are available:
 
 - `?`       : show the help text.
-- `b<x>`    : x = blank -> show MBus state, x = 1 -> MBus OFF x = 1 -> MBus ON
-- `i<x>`    : x = blank -> show interrupt state, x = `4` -> clear MBus interrupt
-- `v`       : display version information
+- `b<x>`    : x = blank -> show MBus state, x = 1 -> MBus OFF x = 1 -> MBus ON.
+- `h`       : turn the emonHP system off.
+- `i<x>`    : x = blank -> show interrupt state, x = `4` -> clear MBus interrupt.
+- `v`       : display version information.
+
+> [!NOTE]
+> A countdown will be provided for safe shut down after the `h` command. Power must be cycled to turn the emonHP back on.
 
 ## Installing the firmware
 
@@ -22,8 +26,9 @@ The emonHP has a small command set, accessible through the UART (115200, 8N1, `\
 After cloning the repository, in `scripts/` run `sudo setup_pi.sh`. This will enable the required UART instances on the GPIO header. You will need to restart the Pi for this to take effect.
 
 The following serial ports will then be available:
+
 - Modbus: `/dev/ttyAMA3`
-- MBUS: `/dev/ttyAMA5` on Pi4, or `/dev/ttyAMA4` on Pi5  
+- MBUS: `/dev/ttyAMA5` on Pi4, or `/dev/ttyAMA4` on Pi5
 
 ### Microcontroller Firmware
 
