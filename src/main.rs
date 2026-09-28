@@ -503,13 +503,13 @@ async fn main(spawner: Spawner) {
 
     let wdt = IndependentWatchdog::new(p.IWDG, 1_000_000);
 
-    // DHW; high-Z.
+    // 1 -> DHW; high-Z.
     let _opa1 = Input::new(p.PA2, Pull::None);
     let _opa1_pu = Input::new(p.PA3, Pull::None);
-    // Pulse counting; soft pull down.
+    // 2 -> OneWire; hard pull up.
     let _opa2 = Input::new(p.PA4, Pull::Down);
-    let _opa2_pu = Input::new(p.PA5, Pull::None);
-    // OneWire; hard pull up.
+    let _opa2_pu = Output::new(p.PA5, Level::High, Speed::Low);
+    // 3 -> OneWire; hard pull up.
     let _opa3 = Input::new(p.PA6, Pull::None);
     let _opa3_pu = Output::new(p.PA7, Level::High, Speed::Low);
 
